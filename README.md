@@ -33,7 +33,7 @@ from db import Database, init_database, get_db
 db = init_database()
 
 # Or with explicit URL
-db = init_database("postgresql+asyncpg://user:pass@localhost/dbname")
+db = init_database('postgresql+asyncpg://user:pass@localhost/dbname')
 ```
 
 ## Configuration
