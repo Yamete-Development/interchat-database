@@ -58,16 +58,12 @@ def extract_base_exports(base_path: Path) -> list[str]:
         # Enum subclasses
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
-                if isinstance(base, ast.Name) and base.id == 'Enum':
-                    exports.append(node.name)
-                elif (
+                if (isinstance(base, ast.Name) and base.id == 'Enum') or (
                     isinstance(base, ast.Attribute)
                     and isinstance(base.value, ast.Name)
                     and base.value.id == 'enum'
                     and base.attr == 'Enum'
-                ):
-                    exports.append(node.name)
-                elif isinstance(base, ast.Attribute) and base.attr == 'Enum':
+                ) or (isinstance(base, ast.Attribute) and base.attr == 'Enum'):
                     exports.append(node.name)
 
         # Top-level assignments like FooEnum = Enum(...)
