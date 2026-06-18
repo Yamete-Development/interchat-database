@@ -120,7 +120,8 @@ class Database:
                 class_=AsyncSession,
             )
             logger.info(
-                'Database engine creation successful (pool_size=%s, max_overflow=%s, pool_timeout=%ss, pool_recycle=%ss)',
+                'Database engine creation successful '
+                '(pool_size=%s, max_overflow=%s, pool_timeout=%ss, pool_recycle=%ss)',
                 pool_size,
                 max_overflow,
                 pool_timeout,
