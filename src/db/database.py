@@ -17,11 +17,19 @@ from __future__ import annotations
 
 import os
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction, async_sessionmaker, create_async_engine
 
 from .logger import logger
+
+_current_session: ContextVar[AsyncSession | None] = ContextVar('_current_session', default=None)
+
+
+def get_current_session() -> AsyncSession | None:
+    """Return the active UOW session for the calling async task, or *None*."""
+    return _current_session.get()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -54,6 +62,7 @@ class UnitOfWork:
     async def __aenter__(self) -> UnitOfWork:
         self._session = self._session_factory()
         self._tx = await self._session.begin()
+        _current_session.set(self._session)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -72,6 +81,7 @@ class UnitOfWork:
             await self._session.close()
             self._session = None
             self._tx = None
+            _current_session.set(None)
 
         if not exc_type:
             for cb in callbacks:
