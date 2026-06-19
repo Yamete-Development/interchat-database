@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
@@ -26,10 +27,10 @@ from .logger import logger
 
 _current_session: ContextVar[AsyncSession | None] = ContextVar('_current_session', default=None)
 
-
-def get_current_session() -> AsyncSession | None:
-    """Return the active UOW session for the calling async task, or *None*."""
-    return _current_session.get()
+# Semaphore that caps the number of concurrent DB sessions process-wide.
+# Prevents unbounded background-task fanout from saturating the connection
+# pool and hitting PostgreSQL's server-side max_connections limit.
+# Override via DB_MAX_CONCURRENT_SESSIONS env var.
 
 
 def _env_int(name: str, default: int) -> int:
@@ -43,12 +44,30 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+_session_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_session_semaphore() -> asyncio.Semaphore:
+    global _session_semaphore
+    if _session_semaphore is None:
+        limit = _env_int('DB_MAX_CONCURRENT_SESSIONS', 20)
+        _session_semaphore = asyncio.Semaphore(limit)
+        logger.info('DB session semaphore initialised (limit=%s)', limit)
+    return _session_semaphore
+
+
+def get_current_session() -> AsyncSession | None:
+    """Return the active UOW session for the calling async task, or *None*."""
+    return _current_session.get()
+
+
 class UnitOfWork:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
         self._session: AsyncSession | None = None
         self._tx: AsyncSessionTransaction | None = None
         self._on_commit: list[Callable[[], Awaitable[None]]] = []
+        self._semaphore_held: bool = False
 
     @property
     def session(self) -> AsyncSession:
@@ -60,35 +79,53 @@ class UnitOfWork:
         self._on_commit.append(callback)
 
     async def __aenter__(self) -> UnitOfWork:
+        try:
+            await asyncio.wait_for(
+                _get_session_semaphore().acquire(),
+                timeout=30.0,
+            )
+            self._semaphore_held = True
+        except TimeoutError:
+            logger.error(
+                'DB session semaphore timeout after 30s — limit is %s concurrent sessions. '
+                'Consider increasing DB_MAX_CONCURRENT_SESSIONS.',
+                _env_int('DB_MAX_CONCURRENT_SESSIONS', 20),
+            )
+            raise
         self._session = self._session_factory()
         self._tx = await self._session.begin()
         _current_session.set(self._session)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._tx is None or self._session is None:
-            raise RuntimeError('UnitOfWork exit without enter')
-
-        callbacks = self._on_commit
-        self._on_commit = []
-
         try:
-            if exc_type:
-                await self._tx.rollback()
-            else:
-                await self._tx.commit()
-        finally:
-            await self._session.close()
-            self._session = None
-            self._tx = None
-            _current_session.set(None)
+            if self._tx is None or self._session is None:
+                raise RuntimeError('UnitOfWork exit without enter')
 
-        if not exc_type:
-            for cb in callbacks:
-                try:
-                    await cb()
-                except Exception:
-                    logger.exception('UnitOfWork post-commit callback failed')
+            callbacks = self._on_commit
+            self._on_commit = []
+
+            try:
+                if exc_type:
+                    await self._tx.rollback()
+                else:
+                    await self._tx.commit()
+            finally:
+                await self._session.close()
+                self._session = None
+                self._tx = None
+                _current_session.set(None)
+
+            if not exc_type:
+                for cb in callbacks:
+                    try:
+                        await cb()
+                    except Exception:
+                        logger.exception('UnitOfWork post-commit callback failed')
+        finally:
+            if self._semaphore_held:
+                _get_session_semaphore().release()
+                self._semaphore_held = False
 
 
 class Database:
@@ -97,8 +134,8 @@ class Database:
         if not self.database_url:
             raise ValueError('DATABASE_URL environment variable is required')
 
-        pool_size = max(1, _env_int('DB_POOL_SIZE', 30))
-        max_overflow = max(0, _env_int('DB_MAX_OVERFLOW', 20))
+        pool_size = max(1, _env_int('DB_POOL_SIZE', 15))
+        max_overflow = max(0, _env_int('DB_MAX_OVERFLOW', 10))
         pool_timeout = max(5, _env_int('DB_POOL_TIMEOUT', 30))
         pool_recycle = max(30, _env_int('DB_POOL_RECYCLE', 300))
 
