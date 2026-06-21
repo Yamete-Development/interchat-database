@@ -50,9 +50,14 @@ _session_semaphore: asyncio.Semaphore | None = None
 def _get_session_semaphore() -> asyncio.Semaphore:
     global _session_semaphore
     if _session_semaphore is None:
-        limit = _env_int('DB_MAX_CONCURRENT_SESSIONS', 20)
+        limit = _env_int('DB_MAX_CONCURRENT_SESSIONS', 25)
         _session_semaphore = asyncio.Semaphore(limit)
-        logger.info('DB session semaphore initialised (limit=%s)', limit)
+        logger.info(
+            'DB session semaphore initialised (limit=%s, pool_size=%s, max_overflow=%s)',
+            limit,
+            _env_int('DB_POOL_SIZE', 15),
+            _env_int('DB_MAX_OVERFLOW', 10),
+        )
     return _session_semaphore
 
 
@@ -86,10 +91,12 @@ class UnitOfWork:
             )
             self._semaphore_held = True
         except TimeoutError:
+            limit = _env_int('DB_MAX_CONCURRENT_SESSIONS', 25)
             logger.error(
                 'DB session semaphore timeout after 30s — limit is %s concurrent sessions. '
-                'Consider increasing DB_MAX_CONCURRENT_SESSIONS.',
-                _env_int('DB_MAX_CONCURRENT_SESSIONS', 20),
+                'Consider increasing DB_MAX_CONCURRENT_SESSIONS or checking for '
+                'long-running transactions blocking pool connections.',
+                limit,
             )
             raise
         self._session = self._session_factory()
@@ -136,10 +143,17 @@ class Database:
 
         pool_size = max(1, _env_int('DB_POOL_SIZE', 15))
         max_overflow = max(0, _env_int('DB_MAX_OVERFLOW', 10))
-        pool_timeout = max(5, _env_int('DB_POOL_TIMEOUT', 30))
+        pool_timeout = max(1, _env_int('DB_POOL_TIMEOUT', 5))
         pool_recycle = max(30, _env_int('DB_POOL_RECYCLE', 300))
+        pool_use_lifo = os.getenv('DB_POOL_USE_LIFO', 'false').strip().lower() in ('true', '1', 'yes')
+        connect_timeout = _env_int('DB_CONNECT_TIMEOUT', 10)
+        command_timeout = _env_int('DB_COMMAND_TIMEOUT', 30)
 
         try:
+            connect_args: dict[str, object] = {
+                'timeout': connect_timeout,
+                'command_timeout': command_timeout,
+            }
             self.engine = create_async_engine(
                 self.database_url,
                 echo=False,
@@ -148,8 +162,9 @@ class Database:
                 pool_pre_ping=True,
                 pool_recycle=pool_recycle,
                 pool_timeout=pool_timeout,
-                pool_use_lifo=True,
+                pool_use_lifo=pool_use_lifo,
                 pool_logging_name='interchat.pool',
+                connect_args=connect_args,
             )
             self.async_session: async_sessionmaker[AsyncSession] = async_sessionmaker(
                 bind=self.engine,
@@ -158,11 +173,15 @@ class Database:
             )
             logger.info(
                 'Database engine creation successful '
-                '(pool_size=%s, max_overflow=%s, pool_timeout=%ss, pool_recycle=%ss)',
+                '(pool_size=%s, max_overflow=%s, pool_timeout=%ss, pool_recycle=%ss, pool_use_lifo=%s, '
+                'connect_timeout=%ss, command_timeout=%ss)',
                 pool_size,
                 max_overflow,
                 pool_timeout,
                 pool_recycle,
+                pool_use_lifo,
+                connect_timeout,
+                command_timeout,
             )
         except Exception as e:
             logger.error(f'Failed to create database engine: {e}')
