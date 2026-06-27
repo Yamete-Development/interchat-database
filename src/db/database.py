@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import os
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
@@ -26,6 +27,49 @@ from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction, async_
 from .logger import logger
 
 _current_session: ContextVar[AsyncSession | None] = ContextVar('_current_session', default=None)
+db_priority_ctx: ContextVar[int] = ContextVar('db_priority_ctx', default=0)
+
+class PrioritySemaphore:
+    def __init__(self, value: int = 1) -> None:
+        if value < 0:
+            raise ValueError("Semaphore initial value must be >= 0")
+        self._value = value
+        self._waiters: list[tuple[int, int, asyncio.Future[None]]] = []
+        self._counter = 0
+
+    async def acquire(self, priority: int = 0) -> bool:
+        if self._value > 0:
+            self._value -= 1
+            return True
+            
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        self._counter += 1
+        heapq.heappush(self._waiters, (priority, self._counter, fut))
+        
+        try:
+            await fut
+            return True
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self.release()
+            else:
+                try:
+                    self._waiters.remove((priority, self._counter, fut))
+                    heapq.heapify(self._waiters)
+                except ValueError:
+                    pass
+            raise
+
+    def release(self) -> None:
+        self._value += 1
+        while self._waiters:
+            _, _, fut = heapq.heappop(self._waiters)
+            if not fut.done():
+                self._value -= 1
+                fut.set_result(None)
+                break
+
 
 # Semaphore that caps the number of concurrent DB sessions process-wide.
 # Prevents unbounded background-task fanout from saturating the connection
@@ -44,14 +88,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-_session_semaphore: asyncio.Semaphore | None = None
+_session_semaphore: PrioritySemaphore | None = None
 
 
-def _get_session_semaphore() -> asyncio.Semaphore:
+def _get_session_semaphore() -> PrioritySemaphore:
     global _session_semaphore
     if _session_semaphore is None:
         limit = _env_int('DB_MAX_CONCURRENT_SESSIONS', 25)
-        _session_semaphore = asyncio.Semaphore(limit)
+        _session_semaphore = PrioritySemaphore(limit)
         logger.info(
             'DB session semaphore initialised (limit=%s, pool_size=%s, max_overflow=%s)',
             limit,
@@ -67,12 +111,13 @@ def get_current_session() -> AsyncSession | None:
 
 
 class UnitOfWork:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], priority: int | None = None) -> None:
         self._session_factory = session_factory
         self._session: AsyncSession | None = None
         self._tx: AsyncSessionTransaction | None = None
         self._on_commit: list[Callable[[], Awaitable[None]]] = []
         self._semaphore_held: bool = False
+        self._priority = priority if priority is not None else db_priority_ctx.get()
 
     @property
     def session(self) -> AsyncSession:
@@ -86,10 +131,9 @@ class UnitOfWork:
     async def __aenter__(self) -> UnitOfWork:
         try:
             await asyncio.wait_for(
-                _get_session_semaphore().acquire(),
+                _get_session_semaphore().acquire(self._priority),
                 timeout=30.0,
             )
-            self._semaphore_held = True
         except TimeoutError:
             limit = _env_int('DB_MAX_CONCURRENT_SESSIONS', 25)
             logger.error(
@@ -99,10 +143,17 @@ class UnitOfWork:
                 limit,
             )
             raise
-        self._session = self._session_factory()
-        self._tx = await self._session.begin()
-        _current_session.set(self._session)
-        return self
+
+        self._semaphore_held = True
+        try:
+            self._session = self._session_factory()
+            self._tx = await self._session.begin()
+            _current_session.set(self._session)
+            return self
+        except BaseException:
+            _get_session_semaphore().release()
+            self._semaphore_held = False
+            raise
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         try:
@@ -200,9 +251,9 @@ class Database:
             logger.error(f'Health check failed: {e}')
             return False
 
-    def uow(self) -> UnitOfWork:
+    def uow(self, priority: int | None = None) -> UnitOfWork:
         """Return a new UnitOfWork manager for handling transactions explicitly."""
-        return UnitOfWork(self.async_session)
+        return UnitOfWork(self.async_session, priority=priority)
 
 
 # Global database singleton
