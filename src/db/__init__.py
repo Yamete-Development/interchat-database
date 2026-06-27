@@ -13,6 +13,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://gnu.org>.
 
-from .database import Database, get_db, init_database
+from .database import Database, get_db, init_database, db_priority_ctx
 
-__all__ = ['Database', 'get_db', 'init_database']
+__all__ = ['Database', 'get_db', 'init_database', 'db_priority_ctx']
