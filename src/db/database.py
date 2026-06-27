@@ -29,6 +29,7 @@ from .logger import logger
 _current_session: ContextVar[AsyncSession | None] = ContextVar('_current_session', default=None)
 db_priority_ctx: ContextVar[int] = ContextVar('db_priority_ctx', default=0)
 
+
 class PrioritySemaphore:
     def __init__(self, value: int = 1):
         self._value = value
@@ -43,19 +44,18 @@ class PrioritySemaphore:
 
     async def acquire(self, priority: int = 0) -> bool:
         loop = asyncio.get_running_loop()
-        
+
         # Fast path if resources are available
-        if self._value > 0:
-            if priority == 0 or self._current_background < self._max_background:
-                self._value -= 1
-                if priority > 0:
-                    self._current_background += 1
-                return True
+        if self._value > 0 and (priority == 0 or self._current_background < self._max_background):
+            self._value -= 1
+            if priority > 0:
+                self._current_background += 1
+            return True
 
         fut: asyncio.Future[None] = loop.create_future()
         self._counter += 1
         heapq.heappush(self._waiters, (priority, self._counter, fut))
-        
+
         try:
             await fut
             return True
@@ -79,7 +79,7 @@ class PrioritySemaphore:
 
         while self._waiters:
             next_priority, _, _ = self._waiters[0]
-            
+
             if next_priority > 0 and self._current_background >= self._max_background:
                 # Top waiter is a background task, but background tasks have reached their limit.
                 # Since queue is sorted by priority, all remaining waiters are also background.
