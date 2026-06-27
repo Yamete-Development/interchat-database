@@ -30,19 +30,28 @@ _current_session: ContextVar[AsyncSession | None] = ContextVar('_current_session
 db_priority_ctx: ContextVar[int] = ContextVar('db_priority_ctx', default=0)
 
 class PrioritySemaphore:
-    def __init__(self, value: int = 1) -> None:
-        if value < 0:
-            raise ValueError("Semaphore initial value must be >= 0")
+    def __init__(self, value: int = 1):
         self._value = value
         self._waiters: list[tuple[int, int, asyncio.Future[None]]] = []
         self._counter = 0
 
+        # Reserve 5 connections strictly for interactive (priority 0) tasks.
+        # This prevents background tasks from completely starving the bot.
+        buffer_size = 5
+        self._max_background = max(1, value - buffer_size)
+        self._current_background = 0
+
     async def acquire(self, priority: int = 0) -> bool:
-        if self._value > 0:
-            self._value -= 1
-            return True
-            
         loop = asyncio.get_running_loop()
+        
+        # Fast path if resources are available
+        if self._value > 0:
+            if priority == 0 or self._current_background < self._max_background:
+                self._value -= 1
+                if priority > 0:
+                    self._current_background += 1
+                return True
+
         fut: asyncio.Future[None] = loop.create_future()
         self._counter += 1
         heapq.heappush(self._waiters, (priority, self._counter, fut))
@@ -52,7 +61,9 @@ class PrioritySemaphore:
             return True
         except asyncio.CancelledError:
             if fut.done() and not fut.cancelled():
-                self.release()
+                # We were woken up just as we were cancelled.
+                # Must release to give it to someone else.
+                self.release(priority)
             else:
                 try:
                     self._waiters.remove((priority, self._counter, fut))
@@ -61,12 +72,24 @@ class PrioritySemaphore:
                     pass
             raise
 
-    def release(self) -> None:
+    def release(self, priority: int = 0) -> None:
         self._value += 1
+        if priority > 0:
+            self._current_background -= 1
+
         while self._waiters:
+            next_priority, _, _ = self._waiters[0]
+            
+            if next_priority > 0 and self._current_background >= self._max_background:
+                # Top waiter is a background task, but background tasks have reached their limit.
+                # Since queue is sorted by priority, all remaining waiters are also background.
+                break
+
             _, _, fut = heapq.heappop(self._waiters)
             if not fut.done():
                 self._value -= 1
+                if next_priority > 0:
+                    self._current_background += 1
                 fut.set_result(None)
                 break
 
@@ -151,7 +174,7 @@ class UnitOfWork:
             _current_session.set(self._session)
             return self
         except BaseException:
-            _get_session_semaphore().release()
+            _get_session_semaphore().release(self._priority)
             self._semaphore_held = False
             raise
 
@@ -182,7 +205,7 @@ class UnitOfWork:
                         logger.exception('UnitOfWork post-commit callback failed')
         finally:
             if self._semaphore_held:
-                _get_session_semaphore().release()
+                _get_session_semaphore().release(self._priority)
                 self._semaphore_held = False
 
 
