@@ -214,9 +214,9 @@ class Database:
         self.database_url: str | None = database_url
         if not self.database_url:
             raise ValueError('DATABASE_URL environment variable is required')
-            
-        if self.database_url.startswith("postgresql://"):
-            self.database_url = self.database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+        if self.database_url.startswith('postgresql://'):
+            self.database_url = self.database_url.replace('postgresql://', 'postgresql+asyncpg://', 1)
 
         pool_size = max(1, _env_int('DB_POOL_SIZE', 30))
         max_overflow = max(0, _env_int('DB_MAX_OVERFLOW', 20))
