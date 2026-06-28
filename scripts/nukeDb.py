@@ -143,5 +143,8 @@ if __name__ == '__main__':
         console.print('[bold red]✗ No database URL provided.[/bold red]')
         console.print('[dim]Pass it as an argument or set the DATABASE_URL environment variable.[/dim]')
         sys.exit(1)
+        
+    if args.url.startswith("postgresql://"):
+        args.url = args.url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
     asyncio.run(_nuke(database_url=args.url, skip_confirm=args.yes))

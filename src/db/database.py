@@ -117,13 +117,13 @@ _session_semaphore: PrioritySemaphore | None = None
 def _get_session_semaphore() -> PrioritySemaphore:
     global _session_semaphore
     if _session_semaphore is None:
-        limit = _env_int('DB_MAX_CONCURRENT_SESSIONS', 25)
+        limit = _env_int('DB_MAX_CONCURRENT_SESSIONS', 50)
         _session_semaphore = PrioritySemaphore(limit)
         logger.info(
             'DB session semaphore initialised (limit=%s, pool_size=%s, max_overflow=%s)',
             limit,
-            _env_int('DB_POOL_SIZE', 15),
-            _env_int('DB_MAX_OVERFLOW', 10),
+            _env_int('DB_POOL_SIZE', 30),
+            _env_int('DB_MAX_OVERFLOW', 20),
         )
     return _session_semaphore
 
@@ -158,7 +158,7 @@ class UnitOfWork:
                 timeout=30.0,
             )
         except TimeoutError:
-            limit = _env_int('DB_MAX_CONCURRENT_SESSIONS', 25)
+            limit = _env_int('DB_MAX_CONCURRENT_SESSIONS', 50)
             logger.error(
                 'DB session semaphore timeout after 30s — limit is %s concurrent sessions. '
                 'Consider increasing DB_MAX_CONCURRENT_SESSIONS or checking for '
@@ -214,9 +214,12 @@ class Database:
         self.database_url: str | None = database_url
         if not self.database_url:
             raise ValueError('DATABASE_URL environment variable is required')
+            
+        if self.database_url.startswith("postgresql://"):
+            self.database_url = self.database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-        pool_size = max(1, _env_int('DB_POOL_SIZE', 15))
-        max_overflow = max(0, _env_int('DB_MAX_OVERFLOW', 10))
+        pool_size = max(1, _env_int('DB_POOL_SIZE', 30))
+        max_overflow = max(0, _env_int('DB_MAX_OVERFLOW', 20))
         pool_timeout = max(1, _env_int('DB_POOL_TIMEOUT', 5))
         pool_recycle = max(30, _env_int('DB_POOL_RECYCLE', 300))
         pool_use_lifo = os.getenv('DB_POOL_USE_LIFO', 'false').strip().lower() in ('true', '1', 'yes')
